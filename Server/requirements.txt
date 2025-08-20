@@ -8,6 +8,7 @@ langchain-core==0.2.40
 langchain-groq==0.1.9
 langchain-text-splitters==0.2.4
 langchain-huggingface==0.0.3
+langchain-chroma
 chromadb==0.4.18
 sentence-transformers>=2.6.0
 groq==0.4.1
