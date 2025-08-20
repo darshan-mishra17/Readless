@@ -104,7 +104,9 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
 
 def create_rag_chain(groq_api_key: str, retriever, session_id: str):
     """Create RAG chain - preserving original logic"""
-    llm = ChatGroq(api_key=SecretStr(groq_api_key), model="Gemma2-9b-It")
+    # Get model from environment variable
+    groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    llm = ChatGroq(api_key=SecretStr(groq_api_key), model=groq_model)
     
     # Contextualize question prompt - same as original
     contextualize_q_system_prompt = (
@@ -172,7 +174,8 @@ async def create_session(request: SessionRequest):
     """Create a new session"""
     try:
         # Validate Groq API key by creating LLM instance
-        ChatGroq(api_key=SecretStr(request.groq_api_key), model="Gemma2-9b-It")
+        groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+        ChatGroq(api_key=SecretStr(request.groq_api_key), model=groq_model)
         
         # Initialize session if it doesn't exist
         get_session_history(request.session_id)
