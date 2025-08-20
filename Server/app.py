@@ -56,7 +56,9 @@ if hf_token:
 
 # Initialize embeddings with error handling
 try:
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    # Only initialize embeddings when actually needed (lazy loading)
+    embeddings = None
+    print("⚠️ Embeddings will be loaded on first use to save memory")
 except Exception as e:
     print(f"Warning: Could not initialize HuggingFace embeddings: {e}")
     print("You may need to set the HF_TOKEN environment variable")
@@ -66,6 +68,22 @@ except Exception as e:
 session_store: Dict[str, ChatMessageHistory] = {}
 session_chains: Dict[str, Any] = {}
 session_retrievers: Dict[str, Any] = {}
+
+def get_embeddings():
+    """Lazy load embeddings to save memory"""
+    global embeddings
+    if embeddings is None:
+        try:
+            print("🔄 Loading HuggingFace embeddings...")
+            hf_token = os.getenv("HF_TOKEN")
+            if hf_token:
+                os.environ['HF_TOKEN'] = hf_token
+            embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+            print("✅ Embeddings loaded successfully")
+        except Exception as e:
+            print(f"❌ Failed to load embeddings: {e}")
+            raise HTTPException(status_code=500, detail="Failed to initialize embeddings")
+    return embeddings
 
 # Pydantic models
 class SessionRequest(BaseModel):
@@ -226,15 +244,14 @@ async def upload_pdfs(
             raise HTTPException(status_code=400, detail="No documents could be processed")
         
         # Split and create embeddings - same logic as original
-        if embeddings is None:
-            raise HTTPException(status_code=500, detail="Embeddings not initialized. Please check HF_TOKEN.")
+        embedding_model = get_embeddings()  # Use lazy loading
         
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=5000, 
             chunk_overlap=500
         )
         splits = text_splitter.split_documents(documents)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+        vectorstore = Chroma.from_documents(documents=splits, embedding=embedding_model)
         retriever = vectorstore.as_retriever()
         
         # Store retriever for session
