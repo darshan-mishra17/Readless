@@ -5,31 +5,31 @@ import { cn } from "@/lib/utils"
 import { API_CONFIG } from "@/lib/api"
 
 interface ServerStatus {
-  pdf: 'checking' | 'online' | 'offline'
+  main: 'checking' | 'online' | 'offline'
   voice: 'checking' | 'online' | 'offline'
 }
 
 export function NavbarServerStatus() {
   const [status, setStatus] = useState<ServerStatus>({
-    pdf: 'checking',
+    main: 'checking',
     voice: 'checking'
   })
 
   const checkServerStatus = async () => {
-    // Check PDF RAG Server
+    // Check Main Server (PDF + Voice)
     try {
-      const pdfResponse = await fetch(`${API_CONFIG.PDF_BASE_URL}/health`, { 
+      const mainResponse = await fetch(`${API_CONFIG.BASE_URL}/health`, { 
         method: 'GET',
         signal: AbortSignal.timeout(3000)
       })
-      setStatus(prev => ({ ...prev, pdf: pdfResponse.ok ? 'online' : 'offline' }))
+      setStatus(prev => ({ ...prev, main: mainResponse.ok ? 'online' : 'offline' }))
     } catch {
-      setStatus(prev => ({ ...prev, pdf: 'offline' }))
+      setStatus(prev => ({ ...prev, main: 'offline' }))
     }
 
-    // Check Voice Chat Server
+    // Check Voice Chat functionality
     try {
-      const voiceResponse = await fetch(`${API_CONFIG.VOICE_BASE_URL}/api/voice-chat/health`, { 
+      const voiceResponse = await fetch(`${API_CONFIG.BASE_URL}/api/voice-chat/health`, { 
         method: 'GET',
         signal: AbortSignal.timeout(3000)
       })
@@ -58,21 +58,21 @@ export function NavbarServerStatus() {
   }
 
   const getTooltipText = () => {
-    const pdfStatus = status.pdf === 'online' ? 'PDF Server: Online' : status.pdf === 'offline' ? 'PDF Server: Offline' : 'PDF Server: Checking...'
-    const voiceStatus = status.voice === 'online' ? 'Voice Server: Online' : status.voice === 'offline' ? 'Voice Server: Offline' : 'Voice Server: Checking...'
-    return `${pdfStatus}\n${voiceStatus}`
+    const mainStatus = status.main === 'online' ? 'Main Server: Online' : status.main === 'offline' ? 'Main Server: Offline' : 'Main Server: Checking...'
+    const voiceStatus = status.voice === 'online' ? 'Voice Chat: Online' : status.voice === 'offline' ? 'Voice Chat: Limited' : 'Voice Chat: Checking...'
+    return `${mainStatus}\n${voiceStatus}`
   }
 
   return (
     <div className="flex items-center space-x-2" title={getTooltipText()}>
       <div className="flex items-center space-x-1">
-        {/* PDF Server Status */}
+        {/* Main Server Status */}
         <div className={cn(
           "w-2 h-2 rounded-full",
-          getStatusColor(status.pdf)
+          getStatusColor(status.main)
         )} />
         
-        {/* Voice Server Status */}
+        {/* Voice Chat Status */}
         <div className={cn(
           "w-2 h-2 rounded-full",
           getStatusColor(status.voice)
@@ -80,8 +80,9 @@ export function NavbarServerStatus() {
       </div>
       
       <span className="text-xs text-gray-600 dark:text-gray-400 font-medium">
-        {status.pdf === 'online' && status.voice === 'online' ? 'All Systems Online' :
-         status.pdf === 'offline' || status.voice === 'offline' ? 'Service Issues' :
+        {status.main === 'online' && status.voice === 'online' ? 'All Systems Online' :
+         status.main === 'offline' ? 'Server Offline' :
+         status.voice === 'offline' ? 'Voice Limited' :
          'Checking...'}
       </span>
     </div>

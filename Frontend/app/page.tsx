@@ -2,6 +2,15 @@
 
 import type React from "react"
 import Link from "next/link"
+import ReactMarkdown from "react-markdown"
+
+// Type declarations for Web Speech API
+declare global {
+  interface Window {
+    SpeechRecognition: any
+    webkitSpeechRecognition: any
+  }
+}
 
 import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
@@ -9,7 +18,7 @@ import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
 import { useToast } from "@/hooks/use-toast"
-import { Upload, Send, Moon, Sun, FileText, X } from "lucide-react"
+import { Upload, Send, Moon, Sun, FileText, X, Mic, MicOff, Volume2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { createSession, uploadPDF, askQuestion, ApiError } from "@/lib/api"
 import { NavbarServerStatus } from "@/components/navbar-server-status"
@@ -32,6 +41,13 @@ export default function PDFChatbot() {
   const [isDragOver, setIsDragOver] = useState(false)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [isSessionCreated, setIsSessionCreated] = useState(false)
+  
+  // Voice chat states
+  const [isListening, setIsListening] = useState(false)
+  const [isSpeaking, setIsSpeaking] = useState(false)
+  const [speechRecognition, setSpeechRecognition] = useState<any>(null)
+  const [speechSynthesis, setSpeechSynthesis] = useState<SpeechSynthesis | null>(null)
+  const [voiceSupported, setVoiceSupported] = useState(false)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -44,6 +60,35 @@ export default function PDFChatbot() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
+
+  // Initialize voice functionality
+  useEffect(() => {
+    const initVoice = () => {
+      try {
+        // Check if Web Speech API is supported
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+        const SpeechSynthesis = window.speechSynthesis
+
+        if (SpeechRecognition && SpeechSynthesis) {
+          const recognition = new SpeechRecognition()
+          recognition.continuous = false
+          recognition.interimResults = false
+          recognition.lang = 'en-US'
+
+          setSpeechRecognition(recognition)
+          setSpeechSynthesis(SpeechSynthesis)
+          setVoiceSupported(true)
+        } else {
+          setVoiceSupported(false)
+        }
+      } catch (error) {
+        console.warn("Voice functionality not supported:", error)
+        setVoiceSupported(false)
+      }
+    }
+
+    initVoice()
+  }, [])
 
   // Initialize session on component mount
   useEffect(() => {
@@ -208,6 +253,167 @@ export default function PDFChatbot() {
     }
   }
 
+  // Voice chat functions
+  const startListening = () => {
+    if (!speechRecognition || !voiceSupported || !uploadedFile) {
+      toast({
+        title: "Voice not available",
+        description: !uploadedFile ? "Please upload a PDF first" : "Voice recognition not supported in this browser",
+        variant: "destructive",
+      })
+      return
+    }
+
+    setIsListening(true)
+    
+    speechRecognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript
+      setInputMessage(transcript)
+      
+      // Automatically send the transcribed message
+      if (transcript.trim()) {
+        sendVoiceMessage(transcript)
+      }
+    }
+
+    speechRecognition.onerror = (event: any) => {
+      console.error('Speech recognition error:', event.error)
+      setIsListening(false)
+      toast({
+        title: "Voice recognition error",
+        description: "Please try again",
+        variant: "destructive",
+      })
+    }
+
+    speechRecognition.onend = () => {
+      setIsListening(false)
+    }
+
+    try {
+      speechRecognition.start()
+    } catch (error) {
+      console.error('Error starting speech recognition:', error)
+      setIsListening(false)
+      toast({
+        title: "Voice recognition error",
+        description: "Could not start voice recognition",
+        variant: "destructive",
+      })
+    }
+  }
+
+  const stopListening = () => {
+    if (speechRecognition) {
+      speechRecognition.stop()
+    }
+    setIsListening(false)
+  }
+
+  const sendVoiceMessage = async (transcript: string) => {
+    if (!transcript.trim() || !uploadedFile || !sessionId) return
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      content: transcript,
+      isUser: true,
+      timestamp: new Date(),
+    }
+
+    setMessages((prev) => [...prev, userMessage])
+    setIsTyping(true)
+
+    try {
+      const response = await askQuestion(transcript, sessionId)
+      
+      const aiMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        content: response.answer,
+        isUser: false,
+        timestamp: new Date(),
+      }
+      
+      setMessages((prev) => [...prev, aiMessage])
+      
+      // Speak the AI response
+      speakText(response.answer)
+      
+    } catch (error) {
+      const errorMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        content: `Sorry, I encountered an error: ${error instanceof ApiError ? error.message : 'Please try again.'}`,
+        isUser: false,
+        timestamp: new Date(),
+      }
+      
+      setMessages((prev) => [...prev, errorMessage])
+      
+      toast({
+        title: "Message failed",
+        description: error instanceof ApiError ? error.message : "Unable to send message. Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsTyping(false)
+      setInputMessage("")
+    }
+  }
+
+  const speakText = (text: string) => {
+    if (!speechSynthesis || !voiceSupported) return
+
+    // Stop any current speech
+    speechSynthesis.cancel()
+
+    // Clean markdown syntax for TTS
+    const cleanText = cleanMarkdownForTTS(text)
+
+    const utterance = new SpeechSynthesisUtterance(cleanText)
+    utterance.rate = 0.9
+    utterance.pitch = 1
+    utterance.volume = 0.8
+
+    utterance.onstart = () => setIsSpeaking(true)
+    utterance.onend = () => setIsSpeaking(false)
+    utterance.onerror = () => setIsSpeaking(false)
+
+    setIsSpeaking(true)
+    speechSynthesis.speak(utterance)
+  }
+
+  const cleanMarkdownForTTS = (text: string): string => {
+    return text
+      // Remove headers (##, ###, etc.)
+      .replace(/^#{1,6}\s+/gm, '')
+      // Remove bold/italic markers
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/__([^_]+)__/g, '$1')
+      .replace(/_([^_]+)_/g, '$1')
+      // Remove code blocks
+      .replace(/```[^`]*```/g, '')
+      .replace(/`([^`]+)`/g, '$1')
+      // Remove links
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      // Remove bullet points
+      .replace(/^[\s]*[-*+]\s+/gm, '')
+      // Remove numbered lists
+      .replace(/^[\s]*\d+\.\s+/gm, '')
+      // Remove blockquotes
+      .replace(/^>\s+/gm, '')
+      // Clean up extra whitespace
+      .replace(/\n\s*\n/g, '\n')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  const stopSpeaking = () => {
+    if (speechSynthesis) {
+      speechSynthesis.cancel()
+    }
+    setIsSpeaking(false)
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#E0EAF3] to-[#cfdef3] dark:from-gray-900 dark:to-gray-800">
       {/* Navbar */}
@@ -353,7 +559,29 @@ export default function PDFChatbot() {
                             : "bg-white/90 dark:bg-gray-800 text-gray-900 dark:text-white",
                         )}
                       >
-                        <p className="text-sm">{message.content}</p>
+                        {message.isUser ? (
+                          <p className="text-sm">{message.content}</p>
+                        ) : (
+                          <div className="text-sm prose prose-sm dark:prose-invert max-w-none">
+                            <ReactMarkdown
+                              components={{
+                                h1: ({ children }) => <h1 className="text-lg font-bold mb-2">{children}</h1>,
+                                h2: ({ children }) => <h2 className="text-md font-semibold mb-1">{children}</h2>,
+                                h3: ({ children }) => <h3 className="text-sm font-medium mb-1">{children}</h3>,
+                                p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+                                ul: ({ children }) => <ul className="list-disc list-inside mb-2 space-y-1">{children}</ul>,
+                                ol: ({ children }) => <ol className="list-decimal list-inside mb-2 space-y-1">{children}</ol>,
+                                li: ({ children }) => <li className="text-sm">{children}</li>,
+                                strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                                em: ({ children }) => <em className="italic">{children}</em>,
+                                code: ({ children }) => <code className="bg-gray-200 dark:bg-gray-700 px-1 py-0.5 rounded text-xs font-mono">{children}</code>,
+                                blockquote: ({ children }) => <blockquote className="border-l-4 border-gray-300 dark:border-gray-600 pl-3 italic">{children}</blockquote>,
+                              }}
+                            >
+                              {message.content}
+                            </ReactMarkdown>
+                          </div>
+                        )}
                         <p className="text-xs opacity-70 mt-1">{message.timestamp.toLocaleTimeString()}</p>
                       </div>
                     </div>
@@ -384,6 +612,42 @@ export default function PDFChatbot() {
                       }
                     }}
                   />
+                  
+                  {/* Voice Chat Buttons */}
+                  {voiceSupported && (
+                    <>
+                      <Button
+                        onClick={isListening ? stopListening : startListening}
+                        disabled={!uploadedFile || isTyping}
+                        variant={isListening ? "destructive" : "outline"}
+                        className={cn(
+                          "rounded-xl px-3",
+                          isListening 
+                            ? "bg-red-500 hover:bg-red-600 text-white animate-pulse" 
+                            : "bg-white/20 border-gray-400/30 dark:border-white/30 text-gray-800 dark:text-white hover:bg-white/30"
+                        )}
+                        title={isListening ? "Stop listening" : "Start voice chat"}
+                      >
+                        {isListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+                      </Button>
+                      
+                      <Button
+                        onClick={stopSpeaking}
+                        disabled={!isSpeaking}
+                        variant="outline"
+                        className={cn(
+                          "rounded-xl px-3",
+                          isSpeaking
+                            ? "bg-orange-500 hover:bg-orange-600 text-white animate-pulse"
+                            : "bg-white/20 border-gray-400/30 dark:border-white/30 text-gray-800 dark:text-white hover:bg-white/30"
+                        )}
+                        title="Stop speaking"
+                      >
+                        <Volume2 className="h-4 w-4" />
+                      </Button>
+                    </>
+                  )}
+                  
                   <Button
                     onClick={sendMessage}
                     disabled={!inputMessage.trim() || isTyping}
@@ -392,6 +656,23 @@ export default function PDFChatbot() {
                     <Send className="h-4 w-4" />
                   </Button>
                 </div>
+                
+                {/* Voice Status Indicator */}
+                {voiceSupported && isListening && (
+                  <div className="mt-2 text-center">
+                    <p className="text-sm text-blue-600 dark:text-blue-400 animate-pulse">
+                      🎤 Listening... Speak your question
+                    </p>
+                  </div>
+                )}
+                
+                {!voiceSupported && (
+                  <div className="mt-2 text-center">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      Voice chat not supported in this browser
+                    </p>
+                  </div>
+                )}
               </div>
             </Card>
           </div>

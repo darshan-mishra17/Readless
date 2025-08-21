@@ -3,8 +3,9 @@ FastAPI RAG Q&A Conversation With PDF Including Chat History
 Industry-grade backend implementation preserving all original logic
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, SecretStr
 from typing import List, Optional, Dict, Any
@@ -12,6 +13,9 @@ import os
 import tempfile
 import uuid
 from datetime import datetime
+import asyncio
+import logging
+import numpy as np
 
 from langchain.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -25,10 +29,84 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 
+# Voice chat imports
+try:
+    import whisper
+    import torch
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Get default GROQ API key from environment
+DEFAULT_GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not DEFAULT_GROQ_API_KEY:
+    print("Warning: GROQ_API_KEY not found in environment variables")
+
+# Get GROQ model from environment
+DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")  # fallback to a working model
+print(f"Using GROQ model: {DEFAULT_GROQ_MODEL}")
+
+# Voice chat globals
+whisper_model = None
+tts_engine = None
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+fastapi_app = FastAPI(
+    title="ReadLess RAG API",
+    description="Conversational RAG with PDF uploads, chat history, and voice chat",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Startup event to initialize voice models
+@fastapi_app.on_event("startup")
+async def startup_event():
+    """Initialize voice models on startup"""
+    logger.info("🚀 Starting ReadLess RAG API with voice chat...")
+    await initialize_voice_models()
+
+# Load environment variables
+load_dotenv()
+
+# Get default GROQ API key from environment
+DEFAULT_GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not DEFAULT_GROQ_API_KEY:
+    print("Warning: GROQ_API_KEY not found in environment variables")
+
+# Get GROQ model from environment
+DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")  # fallback to a working model
+print(f"Using GROQ model: {DEFAULT_GROQ_MODEL}")
+
+# Voice chat globals
+whisper_model = None
+tts_engine = None
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 fastapi_app = FastAPI(
@@ -70,12 +148,12 @@ session_retrievers: Dict[str, Any] = {}
 # Pydantic models
 class SessionRequest(BaseModel):
     session_id: str = "default_session"
-    groq_api_key: str
+    groq_api_key: Optional[str] = None
 
 class QuestionRequest(BaseModel):
     session_id: str
     question: str
-    groq_api_key: str
+    groq_api_key: Optional[str] = None
 
 class SessionResponse(BaseModel):
     session_id: str
@@ -95,6 +173,17 @@ class UploadResponse(BaseModel):
     message: str
     status: str
 
+class VoiceChatResponse(BaseModel):
+    transcribed_text: str
+    ai_response: str
+    audio_duration: Optional[float] = None
+    processing_time: float
+
+class VoiceChatRequest(BaseModel):
+    text: str
+    session_id: str
+    voice_speed: Optional[float] = 1.0
+
 # Helper functions (preserving original logic)
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     """Get or create session history - preserving original logic"""
@@ -104,62 +193,151 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
 
 def create_rag_chain(groq_api_key: str, retriever, session_id: str):
     """Create RAG chain - preserving original logic"""
-    llm = ChatGroq(api_key=SecretStr(groq_api_key), model="Gemma2-9b-It")
+    # Set GROQ_API_KEY environment variable for this request
+    import os
+    original_key = os.environ.get('GROQ_API_KEY')
+    os.environ['GROQ_API_KEY'] = groq_api_key
     
-    # Contextualize question prompt - same as original
-    contextualize_q_system_prompt = (
-        "Given a chat history and the latest user question"
-        "which might reference context in the chat history, "
-        "formulate a standalone question which can be understood "
-        "without the chat history. Do NOT answer the question, "
-        "just reformulate it if needed and otherwise return it as is."
-    )
-    contextualize_q_prompt = ChatPromptTemplate.from_messages([
-        ("system", contextualize_q_system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
+    try:
+        # Create LLM instance using only environment variable (no direct api_key parameter)
+        llm = ChatGroq(model=DEFAULT_GROQ_MODEL, temperature=0)
+        
+        # Contextualize question prompt - same as original
+        contextualize_q_system_prompt = (
+            "Given a chat history and the latest user question"
+            "which might reference context in the chat history, "
+            "formulate a standalone question which can be understood "
+            "without the chat history. Do NOT answer the question, "
+            "just reformulate it if needed and otherwise return it as is."
+        )
+        
+        contextualize_q_prompt = ChatPromptTemplate.from_messages([
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ])
+        
+        history_aware_retriever = create_history_aware_retriever(
+            llm, retriever, contextualize_q_prompt
+        )
+        
+        # Answer question prompt - more restrictive to prevent hallucination with markdown formatting
+        qa_system_prompt = (
+            "You are a strict document assistant. Your ONLY job is to answer questions based EXCLUSIVELY on the provided context from the uploaded PDF document. "
+            "CRITICAL RULES:\n"
+            "1. ONLY use information from the context provided below\n"
+            "2. If the context doesn't contain relevant information to answer the question, respond with: 'I cannot find information about this in the uploaded document.'\n"
+            "3. NEVER generate information that is not explicitly stated in the context\n"
+            "4. Quote or reference specific parts of the document when possible\n"
+            "5. Keep responses concise and directly related to the document content\n"
+            "6. Do NOT use external knowledge - ONLY the document context\n"
+            "7. Format your response in clear, readable markdown with proper headings, bullet points, and emphasis when appropriate\n"
+            "8. Use **bold** for important terms, *italics* for emphasis, and `code blocks` for technical terms\n"
+            "9. Structure your response with headers (##) and bullet points (-) when listing information\n\n"
+            "DOCUMENT CONTEXT:\n{context}\n\n"
+            "Based ONLY on the above context, provide a well-formatted markdown response to the following question:"
+        )
+        
+        qa_prompt = ChatPromptTemplate.from_messages([
+            ("system", qa_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ])
+        
+        question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+        rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+        
+        # Create conversational chain with message history
+        conversational_rag_chain = RunnableWithMessageHistory(
+            rag_chain,
+            get_session_history,
+            input_messages_key="input",
+            history_messages_key="chat_history",
+            output_messages_key="answer",
+        )
+        
+        return conversational_rag_chain
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create RAG chain: {str(e)}")
     
-    history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, contextualize_q_prompt
-    )
+    finally:
+        # Always restore the original environment variable
+        if original_key:
+            os.environ['GROQ_API_KEY'] = original_key
+        else:
+            os.environ.pop('GROQ_API_KEY', None)
+
+# Voice chat helper functions
+async def initialize_voice_models():
+    """Initialize voice models if available"""
+    global whisper_model, tts_engine
     
-    # Answer question prompt - same as original
-    system_prompt = (
-        "You are an assistant for question-answering tasks. "
-        "Use the following pieces of retrieved context to answer "
-        "the question. If you don't know the answer, say that you "
-        "don't know. Use three sentences maximum and keep the "
-        "answer concise."
-        "\n\n"
-        "{context}"
-    )
-    qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-    
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-    
-    def get_session_history_func(session: str) -> BaseChatMessageHistory:
-        return get_session_history(session_id)
-    
-    conversational_rag_chain = RunnableWithMessageHistory(
-        rag_chain,
-        get_session_history_func,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-        output_messages_key="answer"
-    )
-    
-    return conversational_rag_chain
+    try:
+        if WHISPER_AVAILABLE and whisper_model is None:
+            logger.info("🎤 Loading Whisper STT model...")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            whisper_model = whisper.load_model("base", device=device)
+            logger.info(f"✅ Whisper model loaded on {device}")
+        
+        if TTS_AVAILABLE and tts_engine is None:
+            logger.info("🔊 Initializing TTS engine...")
+            tts_engine = pyttsx3.init()
+            tts_engine.setProperty('rate', 150)
+            tts_engine.setProperty('volume', 0.8)
+            logger.info("✅ TTS engine initialized")
+            
+    except Exception as e:
+        logger.warning(f"⚠️ Voice models initialization failed: {e}")
+
+async def transcribe_audio(audio_file_path: str) -> str:
+    """Transcribe audio using Whisper"""
+    try:
+        if not WHISPER_AVAILABLE or whisper_model is None:
+            raise HTTPException(status_code=503, detail="Speech recognition not available")
+        
+        result = whisper_model.transcribe(audio_file_path)
+        return result["text"].strip()
+    except Exception as e:
+        logger.error(f"❌ Transcription error: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+async def convert_text_to_speech(text: str, output_path: str, speed: float = 1.0) -> str:
+    """Convert text to speech"""
+    try:
+        if not TTS_AVAILABLE or tts_engine is None:
+            logger.warning("TTS not available, creating silent audio")
+            # Create a silent audio file as fallback
+            duration = len(text) * 0.1
+            sample_rate = 22050
+            silence = np.zeros(int(duration * sample_rate))
+            
+            import scipy.io.wavfile as wavfile
+            wavfile.write(output_path, sample_rate, silence.astype(np.int16))
+            return output_path
+        
+        tts_engine.setProperty('rate', int(150 * speed))
+        tts_engine.save_to_file(text, output_path)
+        tts_engine.runAndWait()
+        return output_path
+        
+    except Exception as e:
+        logger.error(f"❌ TTS error: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
 
 # API Endpoints
 
 @fastapi_app.get("/")
 async def root():
+    """Root endpoint"""
+    return {
+        "message": "ReadLess RAG API is running",
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@fastapi_app.get("/health")
+async def health():
     """Health check endpoint"""
     return {
         "message": "ReadLess RAG API is running",
@@ -168,11 +346,38 @@ async def root():
     }
 
 @fastapi_app.post("/session/create", response_model=SessionResponse)
-async def create_session(request: SessionRequest):
-    """Create a new session"""
+async def create_session():
+    """Create a new session with default settings"""
     try:
-        # Validate Groq API key by creating LLM instance
-        ChatGroq(api_key=SecretStr(request.groq_api_key), model="Gemma2-9b-It")
+        # Generate a unique session ID
+        session_id = f"session_{uuid.uuid4().hex[:8]}"
+        
+        # Validate that we have the required configuration
+        if not DEFAULT_GROQ_API_KEY:
+            raise HTTPException(status_code=500, detail="Server configuration error: GROQ API key not available")
+        
+        if not DEFAULT_GROQ_MODEL:
+            raise HTTPException(status_code=500, detail="Server configuration error: GROQ model not configured")
+        
+        # Initialize session if it doesn't exist
+        get_session_history(session_id)
+        
+        return SessionResponse(
+            session_id=session_id,
+            message="Session created successfully",
+            status="success"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to create session: {str(e)}")
+
+@fastapi_app.post("/session/create-custom", response_model=SessionResponse)
+async def create_custom_session(request: SessionRequest):
+    """Create a new session with custom API key"""
+    try:
+        # Validate that we have the required configuration
+        api_key = request.groq_api_key or DEFAULT_GROQ_API_KEY
+        if not api_key:
+            raise HTTPException(status_code=400, detail="GROQ API key is required")
         
         # Initialize session if it doesn't exist
         get_session_history(request.session_id)
@@ -188,7 +393,7 @@ async def create_session(request: SessionRequest):
 @fastapi_app.post("/upload", response_model=UploadResponse)
 async def upload_pdfs(
     session_id: str,
-    groq_api_key: str,
+    groq_api_key: Optional[str] = None,
     files: List[UploadFile] = File(...)
 ):
     """Upload and process PDF files - preserving original logic"""
@@ -227,18 +432,28 @@ async def upload_pdfs(
             raise HTTPException(status_code=500, detail="Embeddings not initialized. Please check HF_TOKEN.")
         
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=5000, 
-            chunk_overlap=500
+            chunk_size=1000,  # Smaller chunks for more precise retrieval
+            chunk_overlap=200  # Reduced overlap to avoid redundancy
         )
         splits = text_splitter.split_documents(documents)
         vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever()
+        
+        # Configure retriever to return more relevant chunks
+        retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 6}  # Retrieve top 6 most similar chunks
+        )
         
         # Store retriever for session
         session_retrievers[session_id] = retriever
         
+        # Use provided API key or default
+        api_key = groq_api_key or DEFAULT_GROQ_API_KEY
+        if not api_key:
+            raise HTTPException(status_code=500, detail="GROQ API key not available")
+        
         # Create RAG chain
-        rag_chain = create_rag_chain(groq_api_key, retriever, session_id)
+        rag_chain = create_rag_chain(api_key, retriever, session_id)
         session_chains[session_id] = rag_chain
         
         return UploadResponse(
@@ -348,6 +563,163 @@ async def list_sessions():
         "total_sessions": len(session_store),
         "status": "success"
     }
+
+# Voice Chat Endpoints
+
+@fastapi_app.post("/api/speech-to-text")
+async def speech_to_text(audio: UploadFile = File(...)):
+    """Convert speech to text using Whisper"""
+    if not WHISPER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Speech recognition not available. Install whisper-openai")
+    
+    # Ensure voice models are initialized
+    await initialize_voice_models()
+    
+    start_time = datetime.now()
+    
+    try:
+        # Save uploaded audio file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            content = await audio.read()
+            temp_audio.write(content)
+            temp_audio_path = temp_audio.name
+        
+        # Transcribe audio
+        transcribed_text = await transcribe_audio(temp_audio_path)
+        
+        # Cleanup
+        os.unlink(temp_audio_path)
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        return {
+            "transcribed_text": transcribed_text,
+            "processing_time": processing_time,
+            "status": "success"
+        }
+        
+    except Exception as e:
+        # Cleanup on error
+        if 'temp_audio_path' in locals():
+            try:
+                os.unlink(temp_audio_path)
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Speech-to-text failed: {str(e)}")
+
+@fastapi_app.post("/api/text-to-speech")
+async def text_to_speech(request: VoiceChatRequest):
+    """Convert text to speech"""
+    # Ensure voice models are initialized
+    await initialize_voice_models()
+    
+    start_time = datetime.now()
+    
+    try:
+        # Create temporary file for audio output
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            temp_audio_path = temp_audio.name
+        
+        # Convert text to speech
+        audio_path = await convert_text_to_speech(
+            request.text, 
+            temp_audio_path, 
+            request.voice_speed or 1.0
+        )
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        # Return audio file
+        return FileResponse(
+            audio_path,
+            media_type="audio/wav",
+            filename="response.wav",
+            headers={
+                "Processing-Time": str(processing_time),
+                "Content-Length": str(os.path.getsize(audio_path))
+            }
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text-to-speech failed: {str(e)}")
+
+@fastapi_app.post("/api/voice-chat", response_model=VoiceChatResponse)
+async def voice_chat(
+    audio: UploadFile = File(...),
+    session_id: str = Form(...),
+    voice_speed: float = Form(1.0)
+):
+    """Complete voice chat: STT -> LLM -> TTS"""
+    if not WHISPER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Speech recognition not available")
+    
+    # Ensure voice models are initialized
+    await initialize_voice_models()
+    
+    start_time = datetime.now()
+    
+    try:
+        # Step 1: Speech to Text
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            content = await audio.read()
+            temp_audio.write(content)
+            temp_audio_path = temp_audio.name
+        
+        transcribed_text = await transcribe_audio(temp_audio_path)
+        os.unlink(temp_audio_path)
+        
+        if not transcribed_text.strip():
+            raise HTTPException(status_code=400, detail="No speech detected")
+        
+        # Step 2: Get AI response using existing RAG functionality
+        if session_id not in session_chains:
+            raise HTTPException(status_code=404, detail="Session not found. Please upload a PDF first.")
+        
+        # Use the existing ask question logic
+        chain = session_chains[session_id]
+        
+        # Invoke the chain with session history
+        result = chain.invoke(
+            {"input": transcribed_text},
+            config={"configurable": {"session_id": session_id}}
+        )
+        
+        ai_response = result["answer"]
+        
+        # Step 3: Text to Speech (optional - we can return text response)
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        return VoiceChatResponse(
+            transcribed_text=transcribed_text,
+            ai_response=ai_response,
+            processing_time=processing_time
+        )
+        
+    except Exception as e:
+        # Cleanup on error
+        if 'temp_audio_path' in locals():
+            try:
+                os.unlink(temp_audio_path)
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Voice chat failed: {str(e)}")
+
+@fastapi_app.get("/api/voice-chat/health")
+async def voice_chat_health():
+    """Health check for voice chat functionality"""
+    status = {
+        "whisper_available": WHISPER_AVAILABLE,
+        "tts_available": TTS_AVAILABLE,
+        "whisper_loaded": whisper_model is not None,
+        "tts_loaded": tts_engine is not None,
+        "status": "healthy"
+    }
+    
+    if not WHISPER_AVAILABLE:
+        status["status"] = "limited"
+        status["message"] = "Speech recognition not available"
+    
+    return status
 
 if __name__ == "__main__":
     import uvicorn
