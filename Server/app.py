@@ -40,7 +40,7 @@ fastapi_app = FastAPI(
 # Add CORS middleware
 fastapi_app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your Vercel domain
+    allow_origins=["*"],  # Configure this for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,9 +56,7 @@ if hf_token:
 
 # Initialize embeddings with error handling
 try:
-    # Only initialize embeddings when actually needed (lazy loading)
-    embeddings = None
-    print("⚠️ Embeddings will be loaded on first use to save memory")
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 except Exception as e:
     print(f"Warning: Could not initialize HuggingFace embeddings: {e}")
     print("You may need to set the HF_TOKEN environment variable")
@@ -68,22 +66,6 @@ except Exception as e:
 session_store: Dict[str, ChatMessageHistory] = {}
 session_chains: Dict[str, Any] = {}
 session_retrievers: Dict[str, Any] = {}
-
-def get_embeddings():
-    """Lazy load embeddings to save memory"""
-    global embeddings
-    if embeddings is None:
-        try:
-            print("🔄 Loading HuggingFace embeddings...")
-            hf_token = os.getenv("HF_TOKEN")
-            if hf_token:
-                os.environ['HF_TOKEN'] = hf_token
-            embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-            print("✅ Embeddings loaded successfully")
-        except Exception as e:
-            print(f"❌ Failed to load embeddings: {e}")
-            raise HTTPException(status_code=500, detail="Failed to initialize embeddings")
-    return embeddings
 
 # Pydantic models
 class SessionRequest(BaseModel):
@@ -122,9 +104,7 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
 
 def create_rag_chain(groq_api_key: str, retriever, session_id: str):
     """Create RAG chain - preserving original logic"""
-    # Get model from environment variable
-    groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-    llm = ChatGroq(api_key=SecretStr(groq_api_key), model=groq_model)
+    llm = ChatGroq(api_key=SecretStr(groq_api_key), model="Gemma2-9b-It")
     
     # Contextualize question prompt - same as original
     contextualize_q_system_prompt = (
@@ -192,8 +172,7 @@ async def create_session(request: SessionRequest):
     """Create a new session"""
     try:
         # Validate Groq API key by creating LLM instance
-        groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-        ChatGroq(api_key=SecretStr(request.groq_api_key), model=groq_model)
+        ChatGroq(api_key=SecretStr(request.groq_api_key), model="Gemma2-9b-It")
         
         # Initialize session if it doesn't exist
         get_session_history(request.session_id)
@@ -244,14 +223,15 @@ async def upload_pdfs(
             raise HTTPException(status_code=400, detail="No documents could be processed")
         
         # Split and create embeddings - same logic as original
-        embedding_model = get_embeddings()  # Use lazy loading
+        if embeddings is None:
+            raise HTTPException(status_code=500, detail="Embeddings not initialized. Please check HF_TOKEN.")
         
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=5000, 
             chunk_overlap=500
         )
         splits = text_splitter.split_documents(documents)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embedding_model)
+        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
         retriever = vectorstore.as_retriever()
         
         # Store retriever for session
@@ -371,8 +351,7 @@ async def list_sessions():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000, reload=True)
 
 # Export for external use
 app = fastapi_app

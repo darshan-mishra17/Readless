@@ -3,9 +3,7 @@ services:
     name: readless-backend
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:fastapi_app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: GROQ_API_KEY
-        sync: false
-      - key: HF_TOKEN
         sync: false
