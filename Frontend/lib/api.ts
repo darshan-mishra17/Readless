@@ -1,10 +1,19 @@
 // API configuration and functions for connecting to backend services
 
 export const API_CONFIG = {
-  BASE_URL: 'http://localhost:8000',
+  BASE_URL: process.env.NEXT_PUBLIC_API_URL || 
+    (process.env.NODE_ENV === 'production' 
+      ? 'https://readless-i6cb.onrender.com' 
+      : 'http://localhost:8000'),
   // Keeping legacy names for compatibility
-  PDF_BASE_URL: 'http://localhost:8000',
-  VOICE_BASE_URL: 'http://localhost:8000',
+  PDF_BASE_URL: process.env.NEXT_PUBLIC_API_URL || 
+    (process.env.NODE_ENV === 'production' 
+      ? 'https://readless-i6cb.onrender.com' 
+      : 'http://localhost:8000'),
+  VOICE_BASE_URL: process.env.NEXT_PUBLIC_API_URL || 
+    (process.env.NODE_ENV === 'production' 
+      ? 'https://readless-i6cb.onrender.com' 
+      : 'http://localhost:8000'),
 }
 
 export interface SessionResponse {
