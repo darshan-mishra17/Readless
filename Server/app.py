@@ -185,13 +185,15 @@ def get_embeddings():
     global embeddings
     if embeddings is None:
         try:
+            print("🔄 Loading embeddings model (this will use ~200MB memory)...")
             embeddings = HuggingFaceEmbeddings(
                 model_name="all-MiniLM-L6-v2",
                 model_kwargs={'device': 'cpu'},  # Force CPU to save memory
                 encode_kwargs={'normalize_embeddings': True}
             )
+            print("✅ Embeddings model loaded successfully")
         except Exception as e:
-            print(f"Warning: Could not initialize HuggingFace embeddings: {e}")
+            print(f"❌ Warning: Could not initialize HuggingFace embeddings: {e}")
             print("You may need to set the HF_TOKEN environment variable")
             embeddings = None
     return embeddings
@@ -377,6 +379,34 @@ async def root():
             "optimization": "memory_optimized_for_render"
         }
 
+@fastapi_app.get("/memory-status")
+async def memory_status():
+    """Get current memory usage status"""
+    try:
+        import psutil
+        import os
+        
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        
+        return {
+            "memory_usage_mb": round(memory_mb, 2),
+            "memory_limit_mb": 512,
+            "memory_usage_percent": round((memory_mb / 512) * 100, 2),
+            "embeddings_loaded": embeddings is not None,
+            "active_sessions": len(session_store),
+            "status": "healthy" if memory_mb < 400 else "warning" if memory_mb < 480 else "critical",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "error": f"Could not get memory status: {str(e)}",
+            "embeddings_loaded": embeddings is not None,
+            "active_sessions": len(session_store),
+            "timestamp": datetime.now().isoformat()
+        }
+
 @fastapi_app.get("/health")
 async def health():
     """Health check endpoint"""
@@ -388,7 +418,7 @@ async def health():
 
 @fastapi_app.post("/session/create", response_model=SessionResponse)
 async def create_session():
-    """Create a new session with default settings"""
+    """Create a new session with default settings - NO embeddings loading"""
     try:
         # Generate a unique session ID
         session_id = f"session_{uuid.uuid4().hex[:8]}"
@@ -400,8 +430,10 @@ async def create_session():
         if not DEFAULT_GROQ_MODEL:
             raise HTTPException(status_code=500, detail="Server configuration error: GROQ model not configured")
         
-        # Initialize session if it doesn't exist
+        # Initialize session if it doesn't exist (lightweight operation)
         get_session_history(session_id)
+        
+        print(f"✅ Session {session_id} created successfully (no models loaded yet)")
         
         return SessionResponse(
             session_id=session_id,
@@ -413,15 +445,17 @@ async def create_session():
 
 @fastapi_app.post("/session/create-custom", response_model=SessionResponse)
 async def create_custom_session(request: SessionRequest):
-    """Create a new session with custom API key"""
+    """Create a new session with custom API key - NO embeddings loading"""
     try:
         # Validate that we have the required configuration
         api_key = request.groq_api_key or DEFAULT_GROQ_API_KEY
         if not api_key:
             raise HTTPException(status_code=400, detail="GROQ API key is required")
         
-        # Initialize session if it doesn't exist
+        # Initialize session if it doesn't exist (lightweight operation)
         get_session_history(request.session_id)
+        
+        print(f"✅ Custom session {request.session_id} created successfully (no models loaded yet)")
         
         return SessionResponse(
             session_id=request.session_id,
@@ -468,17 +502,24 @@ async def upload_pdfs(
         if not documents:
             raise HTTPException(status_code=400, detail="No documents could be processed")
         
-        # Split and create embeddings - memory optimized
+        # Split and create embeddings - memory optimized with progress logging
+        print(f"📄 Processing {len(documents)} documents...")
+        
         embeddings_instance = get_embeddings()
         if embeddings_instance is None:
             raise HTTPException(status_code=500, detail="Embeddings not initialized. Please check HF_TOKEN.")
         
+        print("🔄 Creating document chunks...")
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,  # Smaller chunks to reduce memory usage
             chunk_overlap=100  # Reduced overlap
         )
         splits = text_splitter.split_documents(documents)
+        print(f"✅ Created {len(splits)} document chunks")
+        
+        print("🔄 Creating vector store (this may take a moment)...")
         vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings_instance)
+        print("✅ Vector store created successfully")
         
         # Configure retriever to return more relevant chunks
         retriever = vectorstore.as_retriever(
