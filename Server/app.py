@@ -351,12 +351,31 @@ async def convert_text_to_speech(text: str, output_path: str, speed: float = 1.0
 
 @fastapi_app.get("/")
 async def root():
-    """Root endpoint"""
-    return {
-        "message": "ReadLess RAG API is running",
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    }
+    """Root endpoint with memory usage info"""
+    import psutil
+    import os
+    
+    try:
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        
+        return {
+            "message": "ReadLess RAG API is running",
+            "status": "healthy",
+            "memory_usage_mb": round(memory_mb, 2),
+            "memory_limit_mb": 512,
+            "memory_usage_percent": round((memory_mb / 512) * 100, 2),
+            "timestamp": datetime.now().isoformat(),
+            "optimization": "memory_optimized_for_render"
+        }
+    except:
+        return {
+            "message": "ReadLess RAG API is running",
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "optimization": "memory_optimized_for_render"
+        }
 
 @fastapi_app.get("/health")
 async def health():
