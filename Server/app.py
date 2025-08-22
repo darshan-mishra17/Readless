@@ -132,13 +132,8 @@ hf_token = os.getenv("HF_TOKEN")
 if hf_token:
     os.environ['HF_TOKEN'] = hf_token
 
-# Initialize embeddings with error handling
-try:
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-except Exception as e:
-    print(f"Warning: Could not initialize HuggingFace embeddings: {e}")
-    print("You may need to set the HF_TOKEN environment variable")
-    embeddings = None
+# Initialize embeddings with memory optimization for Render
+embeddings = None  # Initialize later on-demand to save memory
 
 # Global storage for sessions (In production, use Redis or database)
 session_store: Dict[str, ChatMessageHistory] = {}
@@ -185,6 +180,22 @@ class VoiceChatRequest(BaseModel):
     voice_speed: Optional[float] = 1.0
 
 # Helper functions (preserving original logic)
+def get_embeddings():
+    """Get embeddings instance (lazy loading for memory optimization)"""
+    global embeddings
+    if embeddings is None:
+        try:
+            embeddings = HuggingFaceEmbeddings(
+                model_name="all-MiniLM-L6-v2",
+                model_kwargs={'device': 'cpu'},  # Force CPU to save memory
+                encode_kwargs={'normalize_embeddings': True}
+            )
+        except Exception as e:
+            print(f"Warning: Could not initialize HuggingFace embeddings: {e}")
+            print("You may need to set the HF_TOKEN environment variable")
+            embeddings = None
+    return embeddings
+
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     """Get or create session history - preserving original logic"""
     if session_id not in session_store:
@@ -270,25 +281,32 @@ def create_rag_chain(groq_api_key: str, retriever, session_id: str):
 
 # Voice chat helper functions
 async def initialize_voice_models():
-    """Initialize voice models if available"""
+    """Initialize voice models if available - memory optimized"""
     global whisper_model, tts_engine
     
     try:
-        if WHISPER_AVAILABLE and whisper_model is None:
+        # Only initialize Whisper if explicitly requested (save memory)
+        if WHISPER_AVAILABLE and whisper_model is None and os.getenv("ENABLE_WHISPER", "false").lower() == "true":
             logger.info("🎤 Loading Whisper STT model...")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            whisper_model = whisper.load_model("base", device=device)
-            logger.info(f"✅ Whisper model loaded on {device}")
+            # Use the smallest model to save memory
+            whisper_model = whisper.load_model("tiny", device="cpu")
+            logger.info("✅ Whisper tiny model loaded on CPU")
+        elif not WHISPER_AVAILABLE:
+            logger.info("🎤 Whisper not available - STT will use browser Web Speech API")
         
-        if TTS_AVAILABLE and tts_engine is None:
+        # Only initialize TTS if available and requested
+        if TTS_AVAILABLE and tts_engine is None and os.getenv("ENABLE_TTS", "false").lower() == "true":
             logger.info("🔊 Initializing TTS engine...")
             tts_engine = pyttsx3.init()
             tts_engine.setProperty('rate', 150)
             tts_engine.setProperty('volume', 0.8)
             logger.info("✅ TTS engine initialized")
+        elif not TTS_AVAILABLE:
+            logger.info("🔊 TTS not available - will use browser Web Speech API")
             
     except Exception as e:
         logger.warning(f"⚠️ Voice models initialization failed: {e}")
+        logger.info("Voice chat will fall back to browser-based speech APIs")
 
 async def transcribe_audio(audio_file_path: str) -> str:
     """Transcribe audio using Whisper"""
@@ -297,7 +315,11 @@ async def transcribe_audio(audio_file_path: str) -> str:
             raise HTTPException(status_code=503, detail="Speech recognition not available")
         
         result = whisper_model.transcribe(audio_file_path)
-        return result["text"].strip()
+        # Handle both dict and other result types
+        if isinstance(result, dict) and "text" in result:
+            return result["text"].strip()
+        else:
+            return str(result).strip()
     except Exception as e:
         logger.error(f"❌ Transcription error: {e}")
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
@@ -427,16 +449,17 @@ async def upload_pdfs(
         if not documents:
             raise HTTPException(status_code=400, detail="No documents could be processed")
         
-        # Split and create embeddings - same logic as original
-        if embeddings is None:
+        # Split and create embeddings - memory optimized
+        embeddings_instance = get_embeddings()
+        if embeddings_instance is None:
             raise HTTPException(status_code=500, detail="Embeddings not initialized. Please check HF_TOKEN.")
         
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,  # Smaller chunks for more precise retrieval
-            chunk_overlap=200  # Reduced overlap to avoid redundancy
+            chunk_size=800,  # Smaller chunks to reduce memory usage
+            chunk_overlap=100  # Reduced overlap
         )
         splits = text_splitter.split_documents(documents)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings_instance)
         
         # Configure retriever to return more relevant chunks
         retriever = vectorstore.as_retriever(
@@ -568,80 +591,21 @@ async def list_sessions():
 
 @fastapi_app.post("/api/speech-to-text")
 async def speech_to_text(audio: UploadFile = File(...)):
-    """Convert speech to text using Whisper"""
-    if not WHISPER_AVAILABLE:
-        raise HTTPException(status_code=503, detail="Speech recognition not available. Install whisper-openai")
-    
-    # Ensure voice models are initialized
-    await initialize_voice_models()
-    
-    start_time = datetime.now()
-    
-    try:
-        # Save uploaded audio file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-            content = await audio.read()
-            temp_audio.write(content)
-            temp_audio_path = temp_audio.name
-        
-        # Transcribe audio
-        transcribed_text = await transcribe_audio(temp_audio_path)
-        
-        # Cleanup
-        os.unlink(temp_audio_path)
-        
-        processing_time = (datetime.now() - start_time).total_seconds()
-        
-        return {
-            "transcribed_text": transcribed_text,
-            "processing_time": processing_time,
-            "status": "success"
-        }
-        
-    except Exception as e:
-        # Cleanup on error
-        if 'temp_audio_path' in locals():
-            try:
-                os.unlink(temp_audio_path)
-            except:
-                pass
-        raise HTTPException(status_code=500, detail=f"Speech-to-text failed: {str(e)}")
+    """Convert speech to text - fallback to browser API if Whisper unavailable"""
+    # For Render deployment, recommend using browser Web Speech API
+    raise HTTPException(
+        status_code=503, 
+        detail="Server-side speech recognition disabled for memory optimization. Please use browser Web Speech API."
+    )
 
 @fastapi_app.post("/api/text-to-speech")
 async def text_to_speech(request: VoiceChatRequest):
-    """Convert text to speech"""
-    # Ensure voice models are initialized
-    await initialize_voice_models()
-    
-    start_time = datetime.now()
-    
-    try:
-        # Create temporary file for audio output
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-            temp_audio_path = temp_audio.name
-        
-        # Convert text to speech
-        audio_path = await convert_text_to_speech(
-            request.text, 
-            temp_audio_path, 
-            request.voice_speed or 1.0
-        )
-        
-        processing_time = (datetime.now() - start_time).total_seconds()
-        
-        # Return audio file
-        return FileResponse(
-            audio_path,
-            media_type="audio/wav",
-            filename="response.wav",
-            headers={
-                "Processing-Time": str(processing_time),
-                "Content-Length": str(os.path.getsize(audio_path))
-            }
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Text-to-speech failed: {str(e)}")
+    """Convert text to speech - fallback to browser API"""
+    # For Render deployment, recommend using browser Web Speech API
+    raise HTTPException(
+        status_code=503,
+        detail="Server-side text-to-speech disabled for memory optimization. Please use browser Web Speech API."
+    )
 
 @fastapi_app.post("/api/voice-chat", response_model=VoiceChatResponse)
 async def voice_chat(
@@ -649,77 +613,22 @@ async def voice_chat(
     session_id: str = Form(...),
     voice_speed: float = Form(1.0)
 ):
-    """Complete voice chat: STT -> LLM -> TTS"""
-    if not WHISPER_AVAILABLE:
-        raise HTTPException(status_code=503, detail="Speech recognition not available")
-    
-    # Ensure voice models are initialized
-    await initialize_voice_models()
-    
-    start_time = datetime.now()
-    
-    try:
-        # Step 1: Speech to Text
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-            content = await audio.read()
-            temp_audio.write(content)
-            temp_audio_path = temp_audio.name
-        
-        transcribed_text = await transcribe_audio(temp_audio_path)
-        os.unlink(temp_audio_path)
-        
-        if not transcribed_text.strip():
-            raise HTTPException(status_code=400, detail="No speech detected")
-        
-        # Step 2: Get AI response using existing RAG functionality
-        if session_id not in session_chains:
-            raise HTTPException(status_code=404, detail="Session not found. Please upload a PDF first.")
-        
-        # Use the existing ask question logic
-        chain = session_chains[session_id]
-        
-        # Invoke the chain with session history
-        result = chain.invoke(
-            {"input": transcribed_text},
-            config={"configurable": {"session_id": session_id}}
-        )
-        
-        ai_response = result["answer"]
-        
-        # Step 3: Text to Speech (optional - we can return text response)
-        processing_time = (datetime.now() - start_time).total_seconds()
-        
-        return VoiceChatResponse(
-            transcribed_text=transcribed_text,
-            ai_response=ai_response,
-            processing_time=processing_time
-        )
-        
-    except Exception as e:
-        # Cleanup on error
-        if 'temp_audio_path' in locals():
-            try:
-                os.unlink(temp_audio_path)
-            except:
-                pass
-        raise HTTPException(status_code=500, detail=f"Voice chat failed: {str(e)}")
+    """Complete voice chat: recommend using browser APIs for STT/TTS"""
+    raise HTTPException(
+        status_code=503,
+        detail="Server-side voice chat disabled for memory optimization. Please use frontend Web Speech API for STT/TTS with /ask endpoint for text processing."
+    )
 
 @fastapi_app.get("/api/voice-chat/health")
 async def voice_chat_health():
     """Health check for voice chat functionality"""
-    status = {
-        "whisper_available": WHISPER_AVAILABLE,
-        "tts_available": TTS_AVAILABLE,
-        "whisper_loaded": whisper_model is not None,
-        "tts_loaded": tts_engine is not None,
-        "status": "healthy"
+    return {
+        "status": "browser_based",
+        "message": "Voice chat uses browser Web Speech API for optimal memory usage",
+        "server_speech": False,
+        "browser_speech": True,
+        "recommendation": "Use frontend Web Speech API with /ask endpoint"
     }
-    
-    if not WHISPER_AVAILABLE:
-        status["status"] = "limited"
-        status["message"] = "Speech recognition not available"
-    
-    return status
 
 if __name__ == "__main__":
     import uvicorn
