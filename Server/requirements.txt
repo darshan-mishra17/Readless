@@ -14,5 +14,3 @@ chromadb
 pydantic
 pydantic-settings
 sentence-transformers
-numpy
-psutil
